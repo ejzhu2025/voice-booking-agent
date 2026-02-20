@@ -39,9 +39,8 @@ async def incoming_call(request: Request):
     """
     # Get the host from request for WebSocket URL
     host = request.headers.get("host", "localhost:8000")
-    # Check x-forwarded-proto header for Railway/reverse proxy deployments
-    forwarded_proto = request.headers.get("x-forwarded-proto", "")
-    protocol = "wss" if forwarded_proto == "https" or "https" in str(request.url) else "ws"
+    # Use wss for Railway deployments, ws for localhost
+    protocol = "wss" if "railway.app" in host or "localhost" not in host else "ws"
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
