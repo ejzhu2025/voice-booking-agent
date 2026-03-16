@@ -1,283 +1,309 @@
 """
-Voice Restaurant Booking Agent Server
+Voice Restaurant Booking Agent — Server
 
-Main server that connects:
-- Twilio (phone calls)
-- Deepgram (STT/TTS)
-- OpenAI (conversation logic)
-- Square (bookings)
+Architecture:
+  Twilio (phone) ↔ WebSocket ↔ Gemini Live API (STT + Gemini LLM + TTS)
+                                        ↕ function calls
+                                   Square API (bookings)
+
+Gemini Live API handles:
+  - Speech-to-text (any language, auto-detect)
+  - Conversation & reasoning (Gemini 2.0 Flash Live)
+  - Text-to-speech (audio response)
+  - Barge-in / interruption natively
+  - Function calling for bookings
 """
 
 import asyncio
 import base64
 import json
-from fastapi import FastAPI, WebSocket, Request, Response
-from fastapi.responses import PlainTextResponse
-import uvicorn
 
-from agents.booking_agent import BookingAgent
-from services.deepgram_service import DeepgramVoiceService
+import uvicorn
+from fastapi import FastAPI, WebSocket, Request, Response
+
+from agents.booking_agent import BookingTools, get_greeting, get_system_prompt, get_tools
+from services.gemini_live_service import GeminiLiveService
 from utils.config import config
 
-app = FastAPI(title="Voice Booking Agent")
+app = FastAPI(title="Voice Booking Agent — Powered by Gemini Live")
 
-# Store active sessions
+# Active sessions (session_id → metadata)
 sessions: dict[str, dict] = {}
+
+
+@app.get("/", response_class=Response)
+async def root():
+    html = """<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Bonchon Voice Booking Agent</title>
+<style>
+  body { font-family: sans-serif; max-width: 700px; margin: 60px auto; padding: 0 20px; color: #333; }
+  h1 { color: #e8341c; }
+  .badge { display: inline-block; background: #34a853; color: white; padding: 4px 10px; border-radius: 12px; font-size: 13px; }
+  pre { background: #f5f5f5; padding: 16px; border-radius: 8px; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; }
+  td, th { border: 1px solid #ddd; padding: 8px 12px; text-align: left; }
+  th { background: #f9f9f9; }
+</style>
+</head>
+<body>
+  <h1>🍗 Bonchon Voice Booking Agent</h1>
+  <p><span class="badge">● LIVE</span> &nbsp; Powered by <strong>Gemini 2.5 Flash Native Audio</strong> on Google Cloud Run</p>
+  <p>A real-time AI voice agent that handles restaurant reservations and pickup orders via phone call.
+     Automatically responds in the caller's language (English, Chinese, Spanish, and more).</p>
+
+  <h2>API Endpoints</h2>
+  <table>
+    <tr><th>Method</th><th>Path</th><th>Description</th></tr>
+    <tr><td>POST</td><td>/incoming-call</td><td>Twilio webhook — starts a phone call session</td></tr>
+    <tr><td>WS</td><td>/media-stream</td><td>Bidirectional audio bridge (Twilio ↔ Gemini Live)</td></tr>
+    <tr><td>POST</td><td>/demo/chat</td><td>Text-based demo (no phone needed)</td></tr>
+    <tr><td>GET</td><td>/health</td><td>Health check</td></tr>
+  </table>
+
+  <h2>Try the Text Demo</h2>
+  <pre>curl -X POST {url}/demo/chat \\
+  -H "Content-Type: application/json" \\
+  -d '{{"message": "I want to book a table for 2 tonight at 7pm"}}'</pre>
+
+  <h2>Tech Stack</h2>
+  <ul>
+    <li><strong>LLM + STT + TTS:</strong> Gemini 2.5 Flash Native Audio (Live API)</li>
+    <li><strong>Phone:</strong> Twilio Media Streams</li>
+    <li><strong>Bookings:</strong> Square API</li>
+    <li><strong>Hosting:</strong> Google Cloud Run</li>
+  </ul>
+</body>
+</html>""".replace("{url}", "https://voice-booking-agent-983680558370.us-central1.run.app")
+    return Response(content=html, media_type="text/html")
 
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
-    return {"status": "ok"}
+    return {"status": "ok", "model": "gemini-2.5-flash-native-audio-latest"}
 
 
 @app.post("/incoming-call")
 async def incoming_call(request: Request):
-    """
-    Twilio webhook for incoming calls.
-    Returns TwiML to connect call to WebSocket.
-    """
-    # Get the host from request for WebSocket URL
+    """Twilio webhook — returns TwiML to stream audio to this server."""
     host = request.headers.get("host", "localhost:8000")
-    # Use wss for Railway deployments, ws for localhost
-    protocol = "wss" if "railway.app" in host or "localhost" not in host else "ws"
+    protocol = "wss" if "localhost" not in host else "ws"
 
+    # Extract caller phone from Twilio POST form data.
+    # NOTE: {{From}} template syntax only works in Twilio TwiML Bins, NOT in
+    # webhook responses. We must read it from the request and inject it directly.
+    form = await request.form()
+    caller = form.get("From", "")
+    print(f"[Twilio] Incoming call from: {caller!r}")
+
+    # No <Say> — Gemini handles the greeting for a consistent voice.
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
         <Stream url="{protocol}://{host}/media-stream">
-            <Parameter name="caller" value="{{{{From}}}}" />
+            <Parameter name="caller" value="{caller}" />
         </Stream>
     </Connect>
 </Response>"""
-
     return Response(content=twiml, media_type="application/xml")
 
 
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket):
     """
-    WebSocket endpoint for Twilio Media Streams.
-    Handles bidirectional audio streaming.
+    WebSocket bridge: Twilio Media Streams ↔ Gemini Live API.
+
+    Audio flow:
+      Twilio → mulaw 8kHz → GeminiLiveService → PCM 16kHz → Gemini Live
+      Gemini Live → PCM 24kHz → GeminiLiveService → mulaw 8kHz → Twilio
     """
     await websocket.accept()
 
-    session_id = None
-    agent = None
-    deepgram = None
     stream_sid = None
+    gemini: GeminiLiveService | None = None
+    tools = BookingTools()
 
-    # Mute flag: ignore transcripts while agent is speaking
-    agent_speaking_until = 0.0
-
-    async def on_transcript(text: str, is_final: bool):
-        """Handle incoming transcripts from Deepgram."""
-        nonlocal agent_speaking_until
-
-        if not is_final or not text.strip():
-            return
-
-        # Ignore transcript if agent is still speaking (echo suppression)
-        now = asyncio.get_event_loop().time()
-        if now < agent_speaking_until:
-            print(f"[Suppressed echo]: {text.strip()}")
-            return
-
-        print(f"User said: {text.strip()}")
-
-        # Process with booking agent
-        response_text = await agent.process_message(text.strip())
-        print(f"Agent response: {response_text}")
-
-        # Convert to speech and send back
-        await send_audio_response(response_text)
-
-    async def send_audio_response(text: str):
-        """Convert text to speech and send to Twilio."""
-        nonlocal agent_speaking_until
-
+    async def send_audio_to_twilio(audio_bytes: bytes):
+        """Forward Gemini's audio response back to Twilio."""
         if not stream_sid:
             return
-
-        # Get TTS audio from Deepgram
-        audio_bytes = await deepgram.text_to_speech(text)
-
-        if audio_bytes:
-            import base64
-            audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
-
-            # Calculate speech duration: mulaw 8kHz = 8000 bytes/sec
-            speech_duration = len(audio_bytes) / 8000.0
-            # Suppress transcription for speech duration + 0.5s buffer (reduced from 1.5s)
-            agent_speaking_until = asyncio.get_event_loop().time() + speech_duration + 0.5
-
-            media_message = {
-                "event": "media",
-                "streamSid": stream_sid,
-                "media": {
-                    "payload": audio_base64,
-                }
-            }
-            await websocket.send_json(media_message)
+        await websocket.send_json({
+            "event": "media",
+            "streamSid": stream_sid,
+            "media": {"payload": base64.b64encode(audio_bytes).decode()},
+        })
 
     try:
-        # Initialize services
-        agent = BookingAgent()
-        deepgram = DeepgramVoiceService()
-
-        # Start Deepgram transcription
-        await deepgram.start_live_transcription(on_transcript)
-
-        # Send initial greeting after connection
-        greeting_sent = False
+        # Start Gemini Live session for this call
+        gemini = GeminiLiveService(
+            on_audio=send_audio_to_twilio,
+            system_prompt=get_system_prompt(),
+            tools=get_tools(),
+            tool_handler=tools.handle,
+        )
+        await gemini.start()
 
         async for message in websocket.iter_text():
             data = json.loads(message)
             event = data.get("event")
 
             if event == "connected":
-                print("Twilio connected")
+                print("[Twilio] WebSocket connected")
 
             elif event == "start":
-                # Call started
                 start_data = data.get("start", {})
                 stream_sid = start_data.get("streamSid")
-                session_id = stream_sid
-                print(f"Call started - Stream SID: {stream_sid}")
-
-                # Store session
-                sessions[session_id] = {
-                    "agent": agent,
-                    "deepgram": deepgram,
-                }
-
-                # Send greeting after short delay
-                if not greeting_sent:
-                    await asyncio.sleep(0.5)
-                    greeting = agent.get_greeting()
-                    await send_audio_response(greeting)
-                    greeting_sent = True
+                sessions[stream_sid] = {"tools": tools}
+                # Extract caller phone number from Twilio stream parameters
+                caller_phone = start_data.get("customParameters", {}).get("caller", "")
+                print(f"[Twilio] Call started — stream SID: {stream_sid}, caller: {caller_phone}")
+                # Trigger Gemini to say the greeting via text kick-start.
+                # User audio stays MUTED until receive loop sees turn_complete.
+                await gemini.send_greeting_kickstart(caller_phone=caller_phone)
 
             elif event == "media":
-                # Incoming audio from caller
-                media = data.get("media", {})
-                payload = media.get("payload", "")
-
+                payload = data.get("media", {}).get("payload", "")
                 if payload:
-                    # Decode base64 audio and send to Deepgram
                     audio_bytes = base64.b64decode(payload)
-                    await deepgram.send_audio(audio_bytes)
+                    await gemini.send_audio(audio_bytes)
 
             elif event == "stop":
-                print("Call ended")
+                print("[Twilio] Call ended")
                 break
 
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        print(f"[Server] WebSocket error: {e}")
 
     finally:
-        # Cleanup
-        if deepgram:
-            await deepgram.stop_transcription()
-        if session_id and session_id in sessions:
-            del sessions[session_id]
-        print("Session cleaned up")
+        if gemini:
+            await gemini.stop()
+        if stream_sid and stream_sid in sessions:
+            del sessions[stream_sid]
+        print("[Server] Session cleaned up")
 
 
 @app.post("/outbound-call")
 async def make_outbound_call(request: Request):
-    """
-    Make an outbound call to a customer.
-    POST body: {"to": "+1234567890"}
-    """
+    """Initiate an outbound call via Twilio."""
     from twilio.rest import Client
 
     body = await request.json()
     to_number = body.get("to")
-
     if not to_number:
         return {"error": "Missing 'to' phone number"}
 
     client = Client(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN)
-
-    # Get webhook URL
     host = request.headers.get("host", "localhost:8000")
-    webhook_url = f"https://{host}/incoming-call"
-
     call = client.calls.create(
         to=to_number,
         from_=config.TWILIO_PHONE_NUMBER,
-        url=webhook_url,
+        url=f"https://{host}/incoming-call",
     )
-
     return {"call_sid": call.sid, "status": "initiated"}
 
 
-# ==================== Demo Mode (Text-based) ====================
+# ── Demo Mode (text-based, uses regular Gemini Flash) ───────────────────────
 
 @app.post("/demo/chat")
 async def demo_chat(request: Request):
     """
-    Text-based demo endpoint for testing without phone.
-    POST body: {"message": "I want to book a table", "session_id": "optional"}
+    Text-based demo for testing without a phone.
+    Uses Gemini 2.0 Flash (non-live) with function calling.
+    POST body: {"message": "...", "session_id": "optional"}
     """
+    from google import genai
+    from google.genai import types as gtypes
+
     body = await request.json()
     message = body.get("message", "")
     session_id = body.get("session_id", "demo")
 
-    # Get or create session
+    # Per-session conversation history
     if session_id not in sessions:
-        sessions[session_id] = {"agent": BookingAgent()}
+        sessions[session_id] = {
+            "history": [],
+            "tools": BookingTools(),
+        }
 
-    agent = sessions[session_id]["agent"]
+    sess = sessions[session_id]
+    history: list = sess["history"]
+    booking_tools: BookingTools = sess["tools"]
 
-    # Process message
-    response = await agent.process_message(message)
+    history.append(gtypes.Content(role="user", parts=[gtypes.Part(text=message)]))
 
-    return {
-        "response": response,
-        "session_id": session_id,
-        "booking_info": agent.booking_info,
-    }
+    client = genai.Client(api_key=config.GOOGLE_API_KEY)
+
+    response = await client.aio.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=history,
+        config=gtypes.GenerateContentConfig(
+            system_instruction=get_system_prompt(),
+            tools=get_tools(),
+        ),
+    )
+
+    candidate = response.candidates[0]
+    history.append(candidate.content)
+
+    # Handle function calls
+    while candidate.content.parts and any(p.function_call for p in candidate.content.parts):
+        tool_results = []
+        for part in candidate.content.parts:
+            if part.function_call:
+                fc = part.function_call
+                result = await booking_tools.handle(fc.name, dict(fc.args))
+                tool_results.append(
+                    gtypes.Part(
+                        function_response=gtypes.FunctionResponse(
+                            name=fc.name,
+                            response=result,
+                        )
+                    )
+                )
+
+        history.append(gtypes.Content(role="user", parts=tool_results))
+
+        response = await client.aio.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=history,
+            config=gtypes.GenerateContentConfig(
+                system_instruction=get_system_prompt(),
+                tools=get_tools(),
+            ),
+        )
+        candidate = response.candidates[0]
+        history.append(candidate.content)
+
+    reply = response.text or ""
+    return {"response": reply, "session_id": session_id}
 
 
 @app.post("/demo/reset")
 async def demo_reset(request: Request):
-    """Reset demo session."""
     body = await request.json()
     session_id = body.get("session_id", "demo")
-
     if session_id in sessions:
-        sessions[session_id]["agent"].reset()
-
+        del sessions[session_id]
     return {"status": "reset", "session_id": session_id}
 
 
-# ==================== Main ====================
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("Voice Restaurant Booking Agent")
-    print("=" * 50)
-    print(f"\nServer starting on http://{config.HOST}:{config.PORT}")
-    print("\nEndpoints:")
-    print("  POST /incoming-call  - Twilio webhook")
-    print("  WS   /media-stream   - Audio streaming")
-    print("  POST /demo/chat      - Text demo mode")
-    print("  GET  /health         - Health check")
-    print("\nTo test with phone:")
-    print("  1. Run: ngrok http 8000")
-    print("  2. Set Twilio webhook to ngrok URL + /incoming-call")
-    print("  3. Call your Twilio number")
-    print("\nTo test text mode:")
-    print('  curl -X POST http://localhost:8000/demo/chat \\')
-    print('       -H "Content-Type: application/json" \\')
-    print('       -d \'{"message": "I want to book a table for 4 tomorrow at 7pm"}\'')
-    print("=" * 50)
+    print("=" * 55)
+    print("  Voice Booking Agent — Gemini Live API")
+    print("=" * 55)
+    print(f"\n  Server: http://{config.HOST}:{config.PORT}")
+    print("\n  Endpoints:")
+    print("    POST /incoming-call   — Twilio webhook")
+    print("    WS   /media-stream    — Audio bridge")
+    print("    POST /demo/chat       — Text demo (no phone needed)")
+    print("    GET  /health          — Health check")
+    print("\n  To test locally:")
+    print("    1. python server.py")
+    print("    2. ngrok http 8000")
+    print("    3. Set Twilio webhook → <ngrok-url>/incoming-call")
+    print("    4. Call your Twilio number")
+    print("=" * 55)
 
-    uvicorn.run(
-        "server:app",
-        host=config.HOST,
-        port=config.PORT,
-        reload=True,
-    )
+    uvicorn.run("server:app", host=config.HOST, port=config.PORT, reload=True)

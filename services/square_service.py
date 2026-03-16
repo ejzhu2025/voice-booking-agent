@@ -1,9 +1,39 @@
-"""Square Bookings API Service - Using REST API directly."""
+"""Square Bookings + Orders API Service - Using REST API directly."""
 
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 import requests
 from utils.config import config
+
+# Menu price table (cents). Key = lowercase name fragment.
+_MENU_PRICES = {
+    # Wings
+    "wings small":   1655, "wings medium":  2995, "wings large":   4235,
+    # Boneless
+    "boneless small":1695, "boneless medium":3190,"boneless large": 4395,
+    # Drumsticks
+    "drumsticks small":1585,"drumsticks medium":2995,"drumsticks large":4135,
+    "drums small":   1585, "drums medium":   2995, "drums large":    4135,
+    # Combo
+    "combo small":   1655, "combo medium":   2995, "combo large":    4235,
+    # Strips
+    "strips small":  1760, "strips medium":  3190, "strips large":   4450,
+    # Main dishes
+    "tteokbokki":    1580, "japchae":        1760, "buldak":         1980,
+    "bulgogi":       2085, "chicken katsu":  1475, "katsu":          1475,
+}
+
+def _price_cents(name: str, size: str = "") -> int:
+    """Look up price in cents. Returns 0 if unknown (allows order to proceed)."""
+    key = f"{name.lower()} {size.lower()}".strip()
+    if key in _MENU_PRICES:
+        return _MENU_PRICES[key]
+    # Try name only
+    for k, v in _MENU_PRICES.items():
+        if name.lower() in k:
+            return v
+    return 0
 
 
 class SquareBookingService:
@@ -61,10 +91,11 @@ class SquareBookingService:
                 if not start_at:
                     continue
 
-                # Convert UTC to local time FIRST, then check date
+                # Convert UTC to Pacific time
                 try:
-                    utc_dt = datetime.strptime(start_at, "%Y-%m-%dT%H:%M:%SZ")
-                    local_dt = utc_dt - timedelta(hours=8)  # UTC to PST
+                    from zoneinfo import ZoneInfo
+                    utc_dt = datetime.strptime(start_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=ZoneInfo("UTC"))
+                    local_dt = utc_dt.astimezone(ZoneInfo("America/Los_Angeles"))
                     booking_date = local_dt.strftime("%Y-%m-%d")
                     local_time = local_dt.strftime("%H:%M")
                 except:
@@ -175,8 +206,10 @@ class SquareBookingService:
             # Parse local time
             local_dt = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
 
-            # Convert to UTC (add 8 hours for PST)
-            utc_dt = local_dt + timedelta(hours=8)
+            # Convert Pacific → UTC
+            from zoneinfo import ZoneInfo
+            local_dt = local_dt.replace(tzinfo=ZoneInfo("America/Los_Angeles"))
+            utc_dt = local_dt.astimezone(ZoneInfo("UTC"))
 
             # Format for Square API
             start_at = utc_dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
@@ -321,10 +354,11 @@ class SquareBookingService:
                 if not start_at:
                     continue
 
-                # Convert UTC to local time, then check date
+                # Convert UTC to Pacific time, then check date
                 try:
-                    utc_dt = datetime.strptime(start_at, "%Y-%m-%dT%H:%M:%SZ")
-                    local_dt = utc_dt - timedelta(hours=8)  # UTC to PST
+                    from zoneinfo import ZoneInfo
+                    utc_dt = datetime.strptime(start_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=ZoneInfo("UTC"))
+                    local_dt = utc_dt.astimezone(ZoneInfo("America/Los_Angeles"))
                     booking_date = local_dt.strftime("%Y-%m-%d")
                 except:
                     continue
@@ -485,6 +519,113 @@ class SquareBookingService:
                 "found": False,
                 "message": f"Error: {str(e)}",
             }
+
+    async def create_pickup_order(
+        self,
+        items: list,
+        pickup_time: str,
+        customer_name: str,
+        customer_phone: str,
+        notes: str = "",
+    ) -> dict:
+        """Create a real pickup order in Square Orders API."""
+        try:
+            # Build line items
+            line_items = []
+            for item in items:
+                name = item.get("name", "Item")
+                size = item.get("size", "")
+                sauce = item.get("sauce", "")
+                qty = str(item.get("quantity", 1))
+                display_name = name
+                if size:
+                    display_name += f" {size}"
+                if sauce:
+                    display_name += f" ({sauce})"
+
+                price_cents = _price_cents(name, size)
+                line_items.append({
+                    "name": display_name,
+                    "quantity": qty,
+                    "base_price_money": {"amount": price_cents, "currency": "USD"},
+                    "note": item.get("notes", ""),
+                })
+
+            # Normalize phone
+            digits = "".join(c for c in customer_phone if c.isdigit())
+            if len(digits) == 10:
+                phone_e164 = f"+1{digits}"
+            elif len(digits) == 11 and digits.startswith("1"):
+                phone_e164 = f"+{digits}"
+            else:
+                phone_e164 = customer_phone
+
+            # Pickup time: try to parse a human time like "6:00 PM" or "ASAP"
+            now = datetime.now()
+            if pickup_time.upper() == "ASAP":
+                pickup_at = (now + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S")
+            else:
+                try:
+                    t = datetime.strptime(pickup_time, "%I:%M %p")
+                    pickup_at = now.replace(hour=t.hour, minute=t.minute, second=0).strftime("%Y-%m-%dT%H:%M:%S")
+                except Exception:
+                    pickup_at = (now + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%S")
+
+            order_note = notes or ""
+
+            payload = {
+                "idempotency_key": str(uuid.uuid4()),
+                "order": {
+                    "location_id": self.location_id,
+                    "line_items": line_items,
+                    "fulfillments": [
+                        {
+                            "type": "PICKUP",
+                            "state": "PROPOSED",
+                            "pickup_details": {
+                                "recipient": {
+                                    "display_name": customer_name,
+                                    "phone_number": phone_e164,
+                                },
+                                "pickup_at": pickup_at,
+                                "note": order_note,
+                            },
+                        }
+                    ],
+                },
+            }
+
+            response = requests.post(
+                f"{self.base_url}/v2/orders",
+                headers=self.headers,
+                json=payload,
+            )
+
+            if response.status_code in (200, 201):
+                order = response.json().get("order", {})
+                order_id = order.get("id", "")[:8].upper()
+                total_cents = sum(
+                    li.get("total_money", {}).get("amount", 0)
+                    for li in order.get("line_items", [])
+                )
+                return {
+                    "success": True,
+                    "order_id": order_id,
+                    "square_order_id": order.get("id"),
+                    "pickup_time": pickup_time,
+                    "customer_name": customer_name,
+                    "customer_phone": phone_e164,
+                    "total": f"${total_cents/100:.2f}" if total_cents else "see receipt",
+                    "message": f"Order {order_id} confirmed for {customer_name}, pickup at {pickup_time}",
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": f"Square order failed ({response.status_code}): {response.text}",
+                }
+
+        except Exception as e:
+            return {"success": False, "message": f"Error creating order: {str(e)}"}
 
     async def cancel_booking(self, booking_id: str) -> dict:
         """Cancel an existing booking."""
