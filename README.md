@@ -4,7 +4,9 @@
 
 VoiceTable is a real-time AI voice agent that handles restaurant phone calls end-to-end: pickup orders, table reservations, menu questions, and more. Powered by Gemini 2.5 Flash Native Audio Live API.
 
-**Try it:** Call the Bonchon demo line and speak naturally. No app, no typing.
+**🎙️ Try it now:** Call **669-201-5051** and speak naturally — place an order, book a table, or ask about the menu. No app, no typing.
+
+**🌐 Demo:** https://voice-booking-agent-983680558370.us-central1.run.app
 
 ---
 
