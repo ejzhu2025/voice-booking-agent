@@ -6,7 +6,7 @@ VoiceTable is a real-time AI voice agent that handles restaurant phone calls end
 
 **🎙️ Try it now:** Call **669-201-5051** and speak naturally — place an order, book a table, or ask about the menu. No app, no typing.
 
-**🎬 Demo video:** https://www.youtube.com/shorts/sUjl1b6btZQ
+**🎬 Demo video:** https://www.youtube.com/shorts/BQhC79C_ZXg
 
 **🌐 Live app:** https://voice-booking-agent-983680558370.us-central1.run.app
 
