@@ -1,5 +1,7 @@
 # 🍗 VoiceTable
 
+![Deploy](https://github.com/ejzhu2025/voice-booking-agent/actions/workflows/deploy.yml/badge.svg)
+
 > **Your restaurant's AI phone staff — answers every call, takes every order.**
 
 VoiceTable is a real-time AI voice agent that handles restaurant phone calls end-to-end: pickup orders, table reservations, menu questions, and more. Powered by Gemini 2.5 Flash Native Audio Live API.
@@ -142,6 +144,20 @@ gcloud run deploy voice-booking-agent \
   --project bonchon-voice-agent
 ```
 
+### GitHub Actions Setup
+
+Add these secrets to your GitHub repo (Settings → Secrets → Actions):
+
+| Secret | Description |
+|---|---|
+| `GCP_SA_KEY` | Google Cloud service account JSON key |
+| `GOOGLE_API_KEY` | Gemini API key |
+| `SQUARE_ACCESS_TOKEN` | Square production access token |
+| `SQUARE_LOCATION_ID` | Square location ID |
+| `TWILIO_ACCOUNT_SID` | Twilio account SID |
+| `TWILIO_AUTH_TOKEN` | Twilio auth token |
+| `TWILIO_PHONE_NUMBER` | Twilio phone number |
+
 ---
 
 ## API Endpoints
@@ -166,3 +182,9 @@ curl -X POST https://voice-booking-agent-983680558370.us-central1.run.app/demo/c
 ## Built for
 
 [Gemini Live Agent Challenge](https://geminiagentchallenge.devpost.com/) — March 2026
+
+---
+
+## License
+
+MIT
