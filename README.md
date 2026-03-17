@@ -8,7 +8,7 @@ VoiceTable is a real-time AI voice agent that handles restaurant phone calls end
 
 **🎬 Demo video:** https://www.youtube.com/shorts/BQhC79C_ZXg
 
-**🌐 Live app:** https://voice-booking-agent-983680558370.us-central1.run.app
+**🌐 Server:** https://voice-booking-agent-983680558370.us-central1.run.app
 
 ---
 
