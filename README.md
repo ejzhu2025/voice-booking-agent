@@ -105,20 +105,21 @@ Tool calls execute against Square (bookings and orders), send SMS confirmations 
 ## Key Engineering Decisions
 
 **Custom VAD instead of Gemini's built-in**
-Gemini's voice activity detection is tuned for microphone-quality audio. Phone audio upsampled from 8kHz to 16kHz produces RMS patterns that trigger false positives. We disabled it and implemented `audioop.rms()`-based VAD with explicit `ActivityStart` / `ActivityEnd` signals:
+Gemini's built-in voice activity detection is tuned for microphone-quality audio. Phone audio upsampled from 8kHz to 16kHz produces RMS energy patterns that caused frequent false triggers — the agent would cut itself off mid-sentence. We disabled it entirely and implemented our own VAD using `audioop.rms()`, sending explicit `ActivityStart` / `ActivityEnd` signals to Gemini:
 ```
-RMS > 300      →  ActivityStart + stream audio
+RMS > 300        →  ActivityStart + stream audio
 Silence > 0.65s  →  ActivityEnd
 ```
+This gives us direct control over turn-taking and eliminates false interruptions.
 
-**Single prompt system for all restaurants**
-Every restaurant — whether seeded at startup or onboarded via API — uses the same `build_system_prompt()` function. Restaurant-specific data (menu, hours, special instructions) is stored as structured JSON and injected at call time. No hardcoded per-restaurant prompts.
+**Single orchestrator over intent router + sub-agents**
+The natural instinct for a multi-intent system is to build a router that classifies the call (order / reservation / cancellation / question) and dispatches to specialized sub-agents. We chose not to do this. Sub-agents add handoff latency, split session context causes the caller to repeat themselves, and failures across agent boundaries are significantly harder to debug. A single agent with six structured tool declarations handles all intents cleanly within one context window.
 
-**Availability logic outside Square**
-Square's booking API doesn't expose table-level capacity. Rather than paying for Square Appointments Premium ($69/month) for capacity management, we implemented availability checks locally: query existing bookings, apply 90-minute dining windows, and return open slots. Square is used only for the actual booking write (which triggers their built-in SMS confirmation).
+**Caller ID reuse — never ask what you already know**
+When a call arrives, Twilio provides the caller's phone number. This number is injected into the Gemini session at the start of every call. The agent uses it as the default contact number and confirms rather than asks: "I'll use the number you're calling from — does that work?" This removes one of the most friction-heavy moments in phone ordering.
 
 **Ring timeout — human-first, AI as fallback**
-When a call comes in, Twilio first dials the restaurant's real number for a configurable timeout (default 15s). Only if no one answers does the AI take over. This means staff can always intercept calls — the AI handles overflow, not replacement.
+When a call comes in, the system first rings the restaurant's real phone number for a configurable timeout (default 15 seconds). Only if no one answers does Ringo take over. Staff can always intercept — the AI handles overflow, not replacement. This design decision made the product acceptable to restaurant owners who were skeptical about handing off calls entirely to AI.
 
 ---
 
