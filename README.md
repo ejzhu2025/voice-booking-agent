@@ -1,5 +1,7 @@
 # Ringo — AI Phone Agent for Restaurants
 
+![unnamed](https://github.com/user-attachments/assets/016103c9-21e5-4d4e-a3ff-918bb98777c8)
+
 ![Deploy](https://github.com/ejzhu2025/voice-booking-agent/actions/workflows/deploy.yml/badge.svg)
 
 > **Every call answered. Every order taken. No staff required.**
