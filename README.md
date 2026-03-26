@@ -121,6 +121,12 @@ When a call arrives, Twilio provides the caller's phone number. This number is i
 **Ring timeout — human-first, AI as fallback**
 When a call comes in, the system first rings the restaurant's real phone number for a configurable timeout (default 15 seconds). Only if no one answers does Ringo take over. Staff can always intercept — the AI handles overflow, not replacement. This design decision made the product acceptable to restaurant owners who were skeptical about handing off calls entirely to AI.
 
+**Output queue flush on barge-in**
+When a caller interrupts while the agent is speaking, Gemini stops generating — but audio chunks already queued for playback keep streaming out. The result: the agent keeps talking over the caller for several seconds after being interrupted. We flush the entire `_output_queue` the moment `ActivityStart` is detected, so the agent stops instantly. VAD controls when we listen; queue flush controls when we stop talking. Both are required for natural turn-taking.
+
+**Confirmation before every write — operational safety over conversational flow**
+The agent never executes a write action (place order, create booking) without first reading back the complete details and receiving an explicit yes. This adds one turn to every transaction. It's intentional. The biggest operational risk in a restaurant voice agent isn't an unnatural conversation — it's a wrong order, a missed allergy, or a double-booked table. Confirmation before commit eliminates the most costly class of errors.
+
 ---
 
 ## Demo
