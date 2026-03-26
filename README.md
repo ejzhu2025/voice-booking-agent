@@ -104,14 +104,6 @@ Tool calls execute against Square (bookings and orders), send SMS confirmations 
 
 ## Key Engineering Decisions
 
-**Custom VAD instead of Gemini's built-in**
-Gemini's built-in voice activity detection is tuned for microphone-quality audio. Phone audio upsampled from 8kHz to 16kHz produces RMS energy patterns that caused frequent false triggers — the agent would cut itself off mid-sentence. We disabled it entirely and implemented our own VAD using `audioop.rms()`, sending explicit `ActivityStart` / `ActivityEnd` signals to Gemini:
-```
-RMS > 300        →  ActivityStart + stream audio
-Silence > 0.65s  →  ActivityEnd
-```
-This gives us direct control over turn-taking and eliminates false interruptions.
-
 **Single orchestrator over intent router + sub-agents**
 The natural instinct for a multi-intent system is to build a router that classifies the call (order / reservation / cancellation / question) and dispatches to specialized sub-agents. We chose not to do this. Sub-agents add handoff latency, split session context causes the caller to repeat themselves, and failures across agent boundaries are significantly harder to debug. A single agent with six structured tool declarations handles all intents cleanly within one context window.
 

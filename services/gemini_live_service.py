@@ -6,10 +6,9 @@ bidirectional audio stream that handles speech recognition,
 conversation logic, function calling, and text-to-speech natively.
 
 Key design notes:
-  - Automatic VAD is DISABLED. We implement our own VAD via audioop.rms()
-    and send explicit ActivityStart / ActivityEnd signals. This is necessary
-    because Gemini's built-in VAD does not reliably detect 8kHz phone audio
-    that has been upsampled to 16kHz.
+  - VAD: Gemini's built-in automatic voice activity detection is used.
+    Audio is streamed continuously; Gemini detects speech and manages turn-taking.
+    Barge-in is handled by flushing the output queue on server_content.interrupted.
   - User audio is MUTED until Gemini finishes the greeting turn (turn_complete).
   - ratecv state is preserved across chunks for clean resampling.
   - Output audio is forwarded via an asyncio Queue so the receive
@@ -29,7 +28,12 @@ from google.genai import types
 
 from utils.config import config
 
-# VAD thresholds
+# VAD mode switch
+# Set USE_BUILTIN_VAD = True to use Gemini's built-in VAD instead of manual RMS-based VAD.
+# Manual VAD (False) is the default — more reliable on 8kHz upsampled phone audio.
+USE_BUILTIN_VAD = True
+
+# Manual VAD thresholds (only used when USE_BUILTIN_VAD = False)
 _SPEECH_RMS_THRESHOLD = 300   # PCM16 8kHz RMS above this = speech
 _SPEECH_END_SILENCE_S = 0.65  # Seconds of silence to end user turn
 
@@ -80,6 +84,22 @@ class GeminiLiveService:
         self._reconnecting = False
 
     def _build_live_config(self) -> types.LiveConnectConfig:
+        if USE_BUILTIN_VAD:
+            realtime_input_config = types.RealtimeInputConfig(
+                # Let Gemini detect speech automatically.
+                # TURN_INCLUDES_ALL_INPUT: all audio (not just activity windows) feeds the turn.
+                turn_coverage=types.TurnCoverage.TURN_INCLUDES_ALL_INPUT,
+            )
+        else:
+            realtime_input_config = types.RealtimeInputConfig(
+                # Disable Gemini's built-in VAD — we send activity signals manually.
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    disabled=True
+                ),
+                # Only audio between ActivityStart and ActivityEnd counts as the turn.
+                turn_coverage=types.TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
+            )
+
         return types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             system_instruction=self.system_prompt,
@@ -91,14 +111,7 @@ class GeminiLiveService:
                     )
                 )
             ),
-            realtime_input_config=types.RealtimeInputConfig(
-                # Disable Gemini's built-in VAD — we send activity signals manually.
-                automatic_activity_detection=types.AutomaticActivityDetection(
-                    disabled=True
-                ),
-                # Only audio between ActivityStart and ActivityEnd counts as the turn.
-                turn_coverage=types.TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
-            ),
+            realtime_input_config=realtime_input_config,
         )
 
     async def start(self):
@@ -212,9 +225,9 @@ class GeminiLiveService:
 
     async def send_audio(self, mulaw_bytes: bytes):
         """
-        Process mulaw 8kHz audio from Twilio.
-        Implements manual VAD: sends activity_start/activity_end to Gemini.
-        Silently drops audio while muted (during greeting).
+        Process mulaw 8kHz audio from Twilio and forward to Gemini.
+        In builtin-VAD mode: stream all audio continuously, let Gemini detect speech.
+        In manual-VAD mode: run RMS-based VAD and send ActivityStart/ActivityEnd signals.
         """
         if not self.session or self._mute_user_audio:
             return
@@ -223,24 +236,50 @@ class GeminiLiveService:
             asyncio.create_task(self._reconnect_session())
             return
 
-        # Convert mulaw 8kHz → PCM16 8kHz for RMS, then → PCM16 16kHz for Gemini
+        # Convert mulaw 8kHz → PCM16 8kHz, then upsample → PCM16 16kHz for Gemini
         pcm8k = audioop.ulaw2lin(mulaw_bytes, 2)
-        rms = audioop.rms(pcm8k, 2)
         pcm16k, self._ratecv_state = audioop.ratecv(
             pcm8k, 2, 1, 8000, 16000, self._ratecv_state
         )
 
+        if USE_BUILTIN_VAD:
+            # ── Built-in VAD mode: stream everything, Gemini handles detection ──
+            self._last_user_audio_t = time.monotonic()
+            self._first_response_logged = False
+            try:
+                await self.session.send_realtime_input(
+                    audio=types.Blob(data=pcm16k, mime_type="audio/pcm;rate=16000")
+                )
+            except Exception as e:
+                print(f"[Audio] send error: {e}")
+                if self._is_session_error(e):
+                    self._session_alive = False
+                    asyncio.create_task(self._reconnect_session())
+            return
+
+        # ── Manual VAD mode ────────────────────────────────────────────────────
+        rms = audioop.rms(pcm8k, 2)
         now = time.monotonic()
 
         if rms > _SPEECH_RMS_THRESHOLD:
-            # ── Speech detected ──────────────────────────────────────────────
+            # Speech detected
             self._last_speech_t = now
             self._last_user_audio_t = now
             self._first_response_logged = False
 
             if not self._in_activity:
-                # Start of a new utterance
+                # Start of a new utterance — flush any queued output first (barge-in)
                 self._in_activity = True
+                flushed = 0
+                while not self._output_queue.empty():
+                    try:
+                        self._output_queue.get_nowait()
+                        self._output_queue.task_done()
+                        flushed += 1
+                    except asyncio.QueueEmpty:
+                        break
+                if flushed:
+                    print(f"[VAD] Flushed {flushed} audio chunks on barge-in")
                 print(f"[VAD] Speech start (RMS={rms})")
                 try:
                     await self.session.send_realtime_input(
@@ -254,7 +293,6 @@ class GeminiLiveService:
                         asyncio.create_task(self._reconnect_session())
                     return
 
-            # Stream audio chunk to Gemini
             try:
                 await self.session.send_realtime_input(
                     audio=types.Blob(data=pcm16k, mime_type="audio/pcm;rate=16000")
@@ -267,8 +305,7 @@ class GeminiLiveService:
                     asyncio.create_task(self._reconnect_session())
 
         elif self._in_activity:
-            # ── In activity but current chunk is silence ──────────────────────
-            # Keep sending audio (natural pauses mid-sentence)
+            # In activity but current chunk is silence — keep sending (natural pauses)
             try:
                 await self.session.send_realtime_input(
                     audio=types.Blob(data=pcm16k, mime_type="audio/pcm;rate=16000")
@@ -281,7 +318,6 @@ class GeminiLiveService:
                     asyncio.create_task(self._reconnect_session())
                 return
 
-            # End activity after sustained silence
             silence_s = now - self._last_speech_t
             if silence_s >= _SPEECH_END_SILENCE_S:
                 self._in_activity = False
@@ -309,6 +345,19 @@ class GeminiLiveService:
                 async for response in self.session.receive():
 
                     if response.server_content:
+                        # Barge-in (builtin VAD): Gemini signals it was interrupted
+                        if USE_BUILTIN_VAD and getattr(response.server_content, "interrupted", False):
+                            flushed = 0
+                            while not self._output_queue.empty():
+                                try:
+                                    self._output_queue.get_nowait()
+                                    self._output_queue.task_done()
+                                    flushed += 1
+                                except asyncio.QueueEmpty:
+                                    break
+                            if flushed:
+                                print(f"[Builtin VAD] Barge-in detected — flushed {flushed} audio chunks")
+
                         # Audio chunks → queue for forwarding to Twilio
                         if response.server_content.model_turn:
                             for part in response.server_content.model_turn.parts:
